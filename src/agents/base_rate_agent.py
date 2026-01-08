@@ -54,9 +54,13 @@ TOOLS = [
                 "events_per_period": {
                     "type": "integer",
                     "description": "For per_event unit: estimated number of events in the time period. E.g., if there are ~50 press conferences per year, put 50."
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Your confidence in this base rate (0 to 1). Use 0.8+ if you have solid historical data, 0.5-0.7 if extrapolating, 0.3-0.5 if highly uncertain."
                 }
             },
-            "required": ["rate", "unit", "reasoning"]
+            "required": ["rate", "unit", "reasoning", "confidence"]
         }
     }
 ]
@@ -129,6 +133,7 @@ class BaseRateAgent:
                 reasoning=tool_input["reasoning"],
                 sources=tool_input.get("sources", []),
                 events_per_period=tool_input.get("events_per_period"),
+                confidence=tool_input.get("confidence", 0.5),
                 last_updated=datetime.utcnow()
             )
             return "Base rate calculated and stored.", base_rate

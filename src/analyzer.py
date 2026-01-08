@@ -18,6 +18,10 @@ class FilterCriteria:
     min_quantity: int = 100  # Minimum available quantity at price
     min_kelly: float = 0.001  # Minimum Kelly fraction
     max_kelly: float = 1.0  # Maximum Kelly fraction
+    min_confidence: float = 0.0  # Minimum base rate confidence
+    # Significance filter: edge must be > min_edge_ratio * fair_prob
+    # E.g., 0.5 means edge must be at least 50% of fair prob (2% fair, 1% edge won't pass)
+    min_edge_ratio: float = 0.0
     platforms: Optional[list[Platform]] = None
     categories: Optional[list[str]] = None
 
@@ -120,10 +124,11 @@ class MarketAnalyzer:
         if edge <= 0 or ev <= 1.0:
             return None
 
+        # For display: fair_prob was already set to fair_no for NO side above
         return OpportunityAnalysis(
             market=market,
             side=side,
-            fair_probability=fair_prob if side == "YES" else (1 - fair_prob),
+            fair_probability=fair_prob,  # Already correct for both sides
             market_probability=market_prob,
             edge=edge,
             expected_value=ev,
@@ -185,6 +190,16 @@ class MarketAnalyzer:
                     continue
                 if opp.kelly_fraction > criteria.max_kelly:
                     continue
+
+                # Confidence filter
+                if market.base_rate and market.base_rate.confidence < criteria.min_confidence:
+                    continue
+
+                # Significance filter: edge must be meaningful relative to probability
+                # This filters out "2% fair vs 1% market" type noise
+                if criteria.min_edge_ratio > 0 and opp.fair_probability > 0:
+                    if opp.edge / opp.fair_probability < criteria.min_edge_ratio:
+                        continue
 
                 opportunities.append(opp)
 

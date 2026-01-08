@@ -88,6 +88,7 @@ class BaseRate:
     reasoning: str  # LLM's reasoning for this rate
     sources: list[str] = field(default_factory=list)  # URLs or references
     events_per_period: Optional[int] = None  # For per-event rates
+    confidence: float = 0.5  # 0-1, how confident is the agent in this rate
     last_updated: datetime = field(default_factory=datetime.utcnow)
 
     def calculate_probability(self, resolution_date: datetime) -> float:
@@ -137,6 +138,7 @@ class BaseRate:
             "reasoning": self.reasoning,
             "sources": self.sources,
             "events_per_period": self.events_per_period,
+            "confidence": self.confidence,
             "last_updated": self.last_updated.isoformat()
         }
 
@@ -148,6 +150,7 @@ class BaseRate:
             reasoning=data["reasoning"],
             sources=data.get("sources", []),
             events_per_period=data.get("events_per_period"),
+            confidence=data.get("confidence", 0.5),
             last_updated=datetime.fromisoformat(data["last_updated"])
         )
 
