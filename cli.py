@@ -18,7 +18,7 @@ from src.storage import MarketStorage
 from src.analyzer import MarketAnalyzer, FilterCriteria
 from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
-from src.agents.base_rate_agent import BaseRateAgent
+from src.agents.base_rate_agent import BaseRateAgent, ResearchTrace
 
 
 def cmd_fetch(args):
@@ -102,18 +102,35 @@ def cmd_research(args):
 
     print(f"Researching base rates for {len(markets)} markets...")
 
+    traces: list[ResearchTrace] = []
+
     with BaseRateAgent(api_key=api_key) as agent:
         for i, market in enumerate(markets, 1):
             print(f"\n[{i}/{len(markets)}] {market.title[:60]}...")
-            try:
-                base_rate = agent.research_base_rate(market)
-                if base_rate:
-                    storage.save_base_rate(market.id, base_rate)
-                    print(f"  -> Rate: {base_rate.rate:.4f} ({base_rate.unit.value})")
-                else:
-                    print("  -> Could not determine base rate")
-            except Exception as e:
-                print(f"  -> Error: {e}")
+            base_rate, trace = agent.research_base_rate(market)
+            traces.append(trace)
+
+            if base_rate:
+                storage.save_base_rate(market.id, base_rate)
+                print(f"  -> Rate: {base_rate.rate:.4f} ({base_rate.unit.value})")
+                print(f"     Confidence: {base_rate.confidence:.0%} | "
+                      f"Iterations: {len(trace.iterations)} | "
+                      f"Tool calls: {trace.total_tool_calls}")
+            else:
+                print("  -> Could not determine base rate")
+
+            if trace.error:
+                print(f"  -> Error: {trace.error}")
+
+    # Save traces if requested
+    if args.trace:
+        trace_data = {
+            "generated_at": datetime.utcnow().isoformat(),
+            "traces": [t.to_dict() for t in traces]
+        }
+        with open(args.trace, "w") as f:
+            json.dump(trace_data, f, indent=2)
+        print(f"\nTraces saved to {args.trace}")
 
     print(f"\nMarkets with base rates: {storage.base_rate_count}")
 
@@ -237,6 +254,7 @@ def main():
     research_parser.add_argument("--url", help="Fetch and research markets from Polymarket event URL")
     research_parser.add_argument("--limit", type=int, default=10)
     research_parser.add_argument("--include-existing", action="store_true")
+    research_parser.add_argument("--trace", "-t", help="Save full execution traces to JSON file")
     research_parser.set_defaults(func=cmd_research)
 
     # Opportunities command

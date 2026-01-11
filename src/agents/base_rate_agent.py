@@ -2,13 +2,85 @@
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import anthropic
 import httpx
 
 from src.models.market import BaseRate, BaseRateUnit, Market
+
+
+@dataclass
+class ToolCall:
+    """Record of a single tool call."""
+    name: str
+    input: dict[str, Any]
+    output: str
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class Iteration:
+    """Record of a single agent iteration."""
+    index: int
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    assistant_text: Optional[str] = None
+    stop_reason: Optional[str] = None
+
+
+@dataclass
+class ResearchTrace:
+    """Full trace of a research_base_rate call."""
+    market_id: str
+    market_title: str
+    started_at: datetime = field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None
+    iterations: list[Iteration] = field(default_factory=list)
+    result: Optional[BaseRate] = None
+    error: Optional[str] = None
+
+    @property
+    def total_tool_calls(self) -> int:
+        return sum(len(it.tool_calls) for it in self.iterations)
+
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if self.completed_at:
+            return (self.completed_at - self.started_at).total_seconds()
+        return None
+
+    def to_dict(self) -> dict:
+        """Convert trace to dictionary for serialization."""
+        return {
+            "market_id": self.market_id,
+            "market_title": self.market_title,
+            "started_at": self.started_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "duration_seconds": self.duration_seconds,
+            "total_iterations": len(self.iterations),
+            "total_tool_calls": self.total_tool_calls,
+            "iterations": [
+                {
+                    "index": it.index,
+                    "stop_reason": it.stop_reason,
+                    "assistant_text": it.assistant_text,
+                    "tool_calls": [
+                        {"name": tc.name, "input": tc.input, "output": tc.output}
+                        for tc in it.tool_calls
+                    ]
+                }
+                for it in self.iterations
+            ],
+            "result": {
+                "rate": self.result.rate,
+                "unit": self.result.unit.value,
+                "confidence": self.result.confidence,
+                "reasoning": self.result.reasoning,
+            } if self.result else None,
+            "error": self.error
+        }
 
 
 # Tool definitions for the agent
@@ -144,7 +216,7 @@ class BaseRateAgent:
         self,
         market: Market,
         max_iterations: int = 5
-    ) -> Optional[BaseRate]:
+    ) -> tuple[Optional[BaseRate], ResearchTrace]:
         """
         Research and calculate base rate for a market.
 
@@ -158,8 +230,9 @@ class BaseRateAgent:
             max_iterations: Maximum tool use iterations
 
         Returns:
-            BaseRate if successfully calculated, None otherwise
+            Tuple of (BaseRate if successfully calculated, ResearchTrace with full execution details)
         """
+        trace = ResearchTrace(market_id=market.id, market_title=market.title)
         system_prompt = """You are a base rate research agent for prediction markets. Your job is to find historical base rates for events.
 
 IMPORTANT GUIDELINES:
@@ -181,7 +254,9 @@ IMPORTANT GUIDELINES:
 
 6. If you can't find good data, make a reasoned estimate and clearly state your uncertainty.
 
-After gathering information, ALWAYS call calculate_base_rate with your findings."""
+7. IMPORTANT: Do not call web_search more than 2 times. If search results are unhelpful, use your general knowledge to estimate.
+
+After gathering information (or if searches are unsuccessful), ALWAYS call calculate_base_rate with your best estimate."""
 
         user_message = f"""Please research the base rate for this prediction market:
 
@@ -206,57 +281,82 @@ Use web_search to find relevant data, then call calculate_base_rate with your fi
         messages = [{"role": "user", "content": user_message}]
 
         base_rate = None
-        iterations = 0
+        iteration_count = 0
 
-        while iterations < max_iterations:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4096,
-                system=system_prompt,
-                tools=TOOLS,
-                messages=messages
-            )
+        try:
+            while iteration_count < max_iterations:
+                current_iteration = Iteration(index=iteration_count)
 
-            # Check if we got a final response
-            if response.stop_reason == "end_turn":
-                break
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=system_prompt,
+                    tools=TOOLS,
+                    messages=messages
+                )
 
-            # Process tool uses
-            if response.stop_reason == "tool_use":
-                # Add assistant's response
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content
-                })
+                current_iteration.stop_reason = response.stop_reason
 
-                # Process each tool use
-                tool_results = []
+                # Extract any text from the response
                 for block in response.content:
-                    if block.type == "tool_use":
-                        result, calculated_rate = self._process_tool_call(
-                            block.name,
-                            block.input
-                        )
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result
-                        })
+                    if hasattr(block, "text"):
+                        current_iteration.assistant_text = block.text
 
-                        if calculated_rate:
-                            base_rate = calculated_rate
+                # Check if we got a final response
+                if response.stop_reason == "end_turn":
+                    trace.iterations.append(current_iteration)
+                    break
 
-                messages.append({"role": "user", "content": tool_results})
+                # Process tool uses
+                if response.stop_reason == "tool_use":
+                    # Add assistant's response
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content
+                    })
 
-            iterations += 1
+                    # Process each tool use
+                    tool_results = []
+                    for block in response.content:
+                        if block.type == "tool_use":
+                            result, calculated_rate = self._process_tool_call(
+                                block.name,
+                                block.input
+                            )
 
-        return base_rate
+                            # Record tool call in trace
+                            current_iteration.tool_calls.append(ToolCall(
+                                name=block.name,
+                                input=block.input,
+                                output=result
+                            ))
+
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result
+                            })
+
+                            if calculated_rate:
+                                base_rate = calculated_rate
+
+                    messages.append({"role": "user", "content": tool_results})
+
+                trace.iterations.append(current_iteration)
+                iteration_count += 1
+
+        except Exception as e:
+            trace.error = str(e)
+
+        trace.result = base_rate
+        trace.completed_at = datetime.utcnow()
+        return base_rate, trace
 
     def batch_research(
         self,
         markets: list[Market],
         skip_existing: bool = True
-    ) -> dict[str, BaseRate]:
+    ) -> tuple[dict[str, BaseRate], list[ResearchTrace]]:
         """
         Research base rates for multiple markets.
 
@@ -265,25 +365,23 @@ Use web_search to find relevant data, then call calculate_base_rate with your fi
             skip_existing: Skip markets that already have base rates
 
         Returns:
-            Dict mapping market ID to BaseRate
+            Tuple of (dict mapping market ID to BaseRate, list of all traces)
         """
         results = {}
+        traces = []
 
         for market in markets:
             if skip_existing and market.base_rate:
                 results[market.id] = market.base_rate
                 continue
 
-            try:
-                base_rate = self.research_base_rate(market)
-                if base_rate:
-                    results[market.id] = base_rate
-                    market.base_rate = base_rate
-            except Exception as e:
-                print(f"Error researching {market.id}: {e}")
-                continue
+            base_rate, trace = self.research_base_rate(market)
+            traces.append(trace)
+            if base_rate:
+                results[market.id] = base_rate
+                market.base_rate = base_rate
 
-        return results
+        return results, traces
 
     def close(self):
         """Close HTTP client."""
