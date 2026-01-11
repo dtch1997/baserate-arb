@@ -25,6 +25,22 @@ def cmd_fetch(args):
     """Fetch markets from exchanges."""
     storage = MarketStorage()
 
+    # Handle URL-based fetching for specific events
+    if args.url:
+        print(f"Fetching markets from URL: {args.url}")
+        with PolymarketClient() as client:
+            try:
+                markets = client.fetch_event_markets(args.url)
+                storage.save_markets(markets)
+                print(f"  Saved {len(markets)} markets from event")
+                for m in markets:
+                    print(f"    - {m.title[:60]}...")
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+        print(f"\nTotal markets in storage: {storage.market_count}")
+        return
+
     if args.platform in ("kalshi", "all"):
         print("Fetching Kalshi markets...")
         api_key = os.getenv("KALSHI_API_KEY")
@@ -39,11 +55,15 @@ def cmd_fetch(args):
             print(f"  Saved {len(markets)} Kalshi markets")
 
     if args.platform in ("polymarket", "all"):
-        print("Fetching Polymarket markets...")
+        tag_info = f" (tag_id={args.tag_id})" if args.tag_id else ""
+        keyword_info = f" (keyword={args.keyword})" if args.keyword else ""
+        print(f"Fetching Polymarket markets{tag_info}{keyword_info}...")
         with PolymarketClient() as client:
             markets = client.fetch_markets_with_prices(
                 min_liquidity=args.min_volume,
-                limit=args.limit
+                limit=args.limit,
+                tag_id=args.tag_id,
+                keyword=args.keyword
             )
             storage.save_markets(markets)
             print(f"  Saved {len(markets)} Polymarket markets")
@@ -60,13 +80,24 @@ def cmd_research(args):
 
     storage = MarketStorage()
 
-    if args.market_id:
+    # Handle URL-based research (fetch + research in one step)
+    if args.url:
+        print(f"Fetching markets from URL: {args.url}")
+        with PolymarketClient() as client:
+            try:
+                markets = client.fetch_event_markets(args.url)
+                storage.save_markets(markets)
+                print(f"  Found {len(markets)} markets")
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
+    elif args.market_id:
         markets = [storage.get_market(args.market_id)]
         if not markets[0]:
             print(f"Market {args.market_id} not found")
             return
     else:
-        markets = storage.get_markets(has_base_rate=not args.include_existing)
+        markets = storage.get_markets(has_base_rate=False if not args.include_existing else None)
         markets = markets[:args.limit]
 
     print(f"Researching base rates for {len(markets)} markets...")
@@ -172,6 +203,20 @@ def cmd_serve(args):
     uvicorn.run("src.web.app:app", host=args.host, port=args.port, reload=args.reload)
 
 
+def cmd_tags(args):
+    """List or search Polymarket tags."""
+    with PolymarketClient() as client:
+        if args.search:
+            tags = client.search_tags(args.search)
+            print(f"Tags matching '{args.search}':")
+        else:
+            tags = client.get_tags(limit=args.limit)
+            print(f"Polymarket tags (showing {len(tags)}):")
+
+        rows = [(t["id"], t["label"]) for t in tags[:args.limit]]
+        print(tabulate(rows, headers=["ID", "Label"], tablefmt="simple"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Base Rate Arbitrage Scanner")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -181,11 +226,15 @@ def main():
     fetch_parser.add_argument("--platform", choices=["kalshi", "polymarket", "all"], default="all")
     fetch_parser.add_argument("--min-volume", type=float, default=0)
     fetch_parser.add_argument("--limit", type=int, default=100)
+    fetch_parser.add_argument("--tag-id", type=int, help="Filter by tag ID (use 'tags' command to list)")
+    fetch_parser.add_argument("--keyword", help="Filter by keyword in title (e.g., 'China')")
+    fetch_parser.add_argument("--url", help="Fetch from specific Polymarket event URL")
     fetch_parser.set_defaults(func=cmd_fetch)
 
     # Research command
     research_parser = subparsers.add_parser("research", help="Research base rates")
     research_parser.add_argument("--market-id", help="Research specific market")
+    research_parser.add_argument("--url", help="Fetch and research markets from Polymarket event URL")
     research_parser.add_argument("--limit", type=int, default=10)
     research_parser.add_argument("--include-existing", action="store_true")
     research_parser.set_defaults(func=cmd_research)
@@ -214,6 +263,12 @@ def main():
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--reload", action="store_true")
     serve_parser.set_defaults(func=cmd_serve)
+
+    # Tags command
+    tags_parser = subparsers.add_parser("tags", help="List/search Polymarket tags")
+    tags_parser.add_argument("--search", "-s", help="Search for tags containing this text")
+    tags_parser.add_argument("--limit", type=int, default=50)
+    tags_parser.set_defaults(func=cmd_tags)
 
     args = parser.parse_args()
     if args.command:

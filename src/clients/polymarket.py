@@ -69,16 +69,33 @@ class PolymarketClient:
         active: bool = True,
         closed: bool = False,
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
+        tag_id: Optional[int] = None
     ) -> list[dict]:
-        """Get markets from Gamma API."""
+        """Get markets from Gamma API.
+
+        Args:
+            tag_id: Filter by tag ID (use get_tags() to find IDs)
+        """
         params = {
             "limit": limit,
             "offset": offset,
             "active": str(active).lower(),
             "closed": str(closed).lower()
         }
+        if tag_id:
+            params["tag_id"] = tag_id
         return self._gamma_request("/markets", params=params)
+
+    def get_tags(self, limit: int = 500) -> list[dict]:
+        """Get available tags for filtering markets."""
+        return self._gamma_request("/tags", params={"limit": limit})
+
+    def search_tags(self, query: str) -> list[dict]:
+        """Search tags by keyword."""
+        tags = self.get_tags(limit=1000)
+        query_lower = query.lower()
+        return [t for t in tags if query_lower in t.get("label", "").lower()]
 
     def get_market(self, condition_id: str) -> dict:
         """Get a single market by condition ID."""
@@ -104,6 +121,48 @@ class PolymarketClient:
         if events:
             return events[0] if isinstance(events, list) else events
         return {}
+
+    def parse_event_url(self, url: str) -> Optional[str]:
+        """Extract event slug from Polymarket URL.
+
+        Handles URLs like:
+        - https://polymarket.com/event/will-china-invade-taiwan-before-2027
+        - polymarket.com/event/will-china-invade-taiwan-before-2027
+        """
+        import re
+        match = re.search(r'polymarket\.com/event/([^/?#]+)', url)
+        return match.group(1) if match else None
+
+    def fetch_event_markets(self, url_or_slug: str) -> list[Market]:
+        """Fetch all markets from a Polymarket event URL or slug.
+
+        Args:
+            url_or_slug: Either a full URL or just the event slug
+
+        Returns:
+            List of Market objects from that event
+        """
+        # Extract slug if full URL provided
+        if 'polymarket.com' in url_or_slug:
+            slug = self.parse_event_url(url_or_slug)
+            if not slug:
+                raise ValueError(f"Could not parse event slug from URL: {url_or_slug}")
+        else:
+            slug = url_or_slug
+
+        event = self.get_event(slug)
+        if not event:
+            raise ValueError(f"Event not found: {slug}")
+
+        markets = []
+        # Events contain markets in the "markets" field
+        raw_markets = event.get("markets", [])
+
+        for raw in raw_markets:
+            market = self.parse_market(raw)
+            markets.append(market)
+
+        return markets
 
     def get_orderbook(self, token_id: str) -> dict:
         """Get order book for a token (YES or NO side of a market)."""
@@ -226,16 +285,34 @@ class PolymarketClient:
         self,
         active: bool = True,
         min_liquidity: float = 0,
-        limit: int = 50
+        limit: int = 50,
+        tag_id: Optional[int] = None,
+        keyword: Optional[str] = None
     ) -> list[Market]:
-        """Fetch markets with current prices."""
-        raw_markets = self.get_markets(active=active, limit=limit * 2)
+        """Fetch markets with current prices.
+
+        Args:
+            tag_id: Filter by tag ID (use get_tags()/search_tags() to find IDs)
+            keyword: Filter by keyword in title (client-side filtering)
+        """
+        # Fetch more if we're filtering client-side
+        fetch_limit = limit * 10 if keyword else limit * 2
+        raw_markets = self.get_markets(active=active, limit=fetch_limit, tag_id=tag_id)
 
         markets = []
+        keyword_lower = keyword.lower() if keyword else None
+
         for raw in raw_markets:
             liquidity = float(raw.get("liquidity", 0) or 0)
             if liquidity < min_liquidity:
                 continue
+
+            # Client-side keyword filtering
+            if keyword_lower:
+                question = raw.get("question", "").lower()
+                description = raw.get("description", "").lower()
+                if keyword_lower not in question and keyword_lower not in description:
+                    continue
 
             market = self.parse_market(raw)
             markets.append(market)
